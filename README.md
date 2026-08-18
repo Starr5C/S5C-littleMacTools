@@ -1,4 +1,4 @@
-# MacTools
+# littleMacTools
 
 存放一些由 AI 协作构建的 macOS 效率小工具。
 
