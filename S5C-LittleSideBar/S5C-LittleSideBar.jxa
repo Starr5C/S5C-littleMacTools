@@ -1,0 +1,398 @@
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+
+var CONFIG = {
+    builtInReserveRatio: 0.0442,
+    externalReserveRatio: 0.03125,
+    edgeTolerance: 2,
+    retryDelaySeconds: 0.08
+};
+
+var SCRIPT_TITLE = "右侧最大化（保留台前调度）";
+
+function fail(message) {
+    throw new Error(message);
+}
+
+function number(value, label) {
+    var result = Number(value);
+    if (!isFinite(result)) {
+        fail("无法读取" + label + "。");
+    }
+    return result;
+}
+
+function makeRect(x, y, width, height) {
+    return {
+        x: number(x, "横坐标"),
+        y: number(y, "纵坐标"),
+        width: number(width, "宽度"),
+        height: number(height, "高度")
+    };
+}
+
+function rectFromCocoa(nsRect) {
+    return makeRect(
+        nsRect.origin.x,
+        nsRect.origin.y,
+        nsRect.size.width,
+        nsRect.size.height
+    );
+}
+
+function cocoaRectToAccessibility(rect, primaryTop) {
+    return makeRect(
+        rect.x,
+        primaryTop - (rect.y + rect.height),
+        rect.width,
+        rect.height
+    );
+}
+
+function intersectionArea(a, b) {
+    var left = Math.max(a.x, b.x);
+    var top = Math.max(a.y, b.y);
+    var right = Math.min(a.x + a.width, b.x + b.width);
+    var bottom = Math.min(a.y + a.height, b.y + b.height);
+    return Math.max(0, right - left) * Math.max(0, bottom - top);
+}
+
+function distanceSquaredFromPointToRect(point, rect) {
+    var nearestX = Math.max(rect.x, Math.min(point.x, rect.x + rect.width));
+    var nearestY = Math.max(rect.y, Math.min(point.y, rect.y + rect.height));
+    var dx = point.x - nearestX;
+    var dy = point.y - nearestY;
+    return dx * dx + dy * dy;
+}
+
+function chooseScreen(windowRect, screens) {
+    if (!screens.length) {
+        fail("没有读取到可用显示器。" );
+    }
+
+    var best = screens[0];
+    var bestArea = -1;
+    var bestDistance = Infinity;
+    var center = {
+        x: windowRect.x + windowRect.width / 2,
+        y: windowRect.y + windowRect.height / 2
+    };
+
+    screens.forEach(function (screen) {
+        var area = intersectionArea(windowRect, screen.frame);
+        var distance = distanceSquaredFromPointToRect(center, screen.frame);
+        if (area > bestArea || (area === bestArea && distance < bestDistance)) {
+            best = screen;
+            bestArea = area;
+            bestDistance = distance;
+        }
+    });
+
+    return best;
+}
+
+function reserveForScreen(screen) {
+    var ratio = screen.isBuiltIn ?
+        CONFIG.builtInReserveRatio : CONFIG.externalReserveRatio;
+    return Math.round(screen.visibleFrame.width * ratio);
+}
+
+function targetRectForVisibleFrame(visibleFrame, reserve) {
+    reserve = Math.round(number(reserve, "左侧预留宽度"));
+
+    var left = Math.round(visibleFrame.x + reserve);
+    var top = Math.round(visibleFrame.y);
+    var right = Math.round(visibleFrame.x + visibleFrame.width);
+    var bottom = Math.round(visibleFrame.y + visibleFrame.height);
+
+    if (reserve < 0 || right <= left || bottom <= top) {
+        fail("显示器可用区域太小，无法保留台前调度空间。" );
+    }
+
+    return {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+        reserve: reserve
+    };
+}
+
+function arrayPair(value, label) {
+    if (!value || value.length < 2) {
+        fail("无法读取窗口" + label + "。" );
+    }
+    return [number(value[0], label), number(value[1], label)];
+}
+
+function windowRect(windowObject) {
+    var position = arrayPair(windowObject.position(), "位置");
+    var size = arrayPair(windowObject.size(), "尺寸");
+    return makeRect(position[0], position[1], size[0], size[1]);
+}
+
+function readAttribute(windowObject, name) {
+    try {
+        return windowObject.attributes.byName(name).value();
+    } catch (error) {
+        return null;
+    }
+}
+
+function pauseForWindowServer() {
+    try {
+        $.NSThread.sleepForTimeInterval(CONFIG.retryDelaySeconds);
+    } catch (ignored) {}
+}
+
+function screenDescriptions() {
+    $.NSApplication.sharedApplication;
+
+    var nativeScreens = $.NSScreen.screens.js;
+    if (!nativeScreens.length) {
+        fail("没有读取到显示器信息。请在已登录的图形桌面中运行此快捷指令。" );
+    }
+
+    var primary = nativeScreens.filter(function (screen) {
+        var frame = rectFromCocoa(screen.frame);
+        return frame.x === 0 && frame.y === 0;
+    })[0] || nativeScreens[0];
+    var primaryFrame = rectFromCocoa(primary.frame);
+    var primaryTop = primaryFrame.y + primaryFrame.height;
+
+    return nativeScreens.map(function (screen) {
+        var frame = rectFromCocoa(screen.frame);
+        var visibleFrame = rectFromCocoa(screen.visibleFrame);
+        var displayNumber = screen.deviceDescription.objectForKey("NSScreenNumber");
+        var displayIdentifier = number(ObjC.unwrap(displayNumber), "显示器标识");
+        return {
+            name: ObjC.unwrap(screen.localizedName),
+            frame: cocoaRectToAccessibility(frame, primaryTop),
+            visibleFrame: cocoaRectToAccessibility(visibleFrame, primaryTop),
+            scale: number(screen.backingScaleFactor, "显示器缩放比例"),
+            isBuiltIn: Boolean($.CGDisplayIsBuiltin(displayIdentifier))
+        };
+    });
+}
+
+function frontWindow() {
+    var nativeApplication = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (!nativeApplication) {
+        fail("没有找到当前前台应用。");
+    }
+
+    var appName = String(ObjC.unwrap(nativeApplication.localizedName));
+    if (/^(Shortcuts|快捷指令|Shortcuts Events|Shortcuts Runner|快捷指令运行程序)$/i.test(appName)) {
+        fail("当前前台应用是快捷指令。请先选中目标窗口，再用全局快捷键运行。");
+    }
+
+    var systemEvents = Application("System Events");
+    var process = systemEvents.applicationProcesses.byName(appName);
+    if (!process.exists()) {
+        fail("无法通过辅助功能访问 " + appName + "。请检查快捷指令的辅助功能权限。");
+    }
+
+    var windows = process.windows();
+    if (!windows.length) {
+        fail(appName + " 当前没有可调整的窗口。" );
+    }
+
+    var windowObject = null;
+    try {
+        windowObject = process.attributes.byName("AXFocusedWindow").value();
+    } catch (ignored) {}
+    if (!windowObject) {
+        windowObject = process.windows[0];
+    }
+
+    var fullScreen = readAttribute(windowObject, "AXFullScreen");
+    if (fullScreen === true || Number(fullScreen) === 1) {
+        fail("当前窗口处于系统全屏。请先退出全屏后再运行。" );
+    }
+
+    return {
+        appName: appName,
+        windowObject: windowObject,
+        rect: windowRect(windowObject)
+    };
+}
+
+function setWindowRect(windowObject, target) {
+    var changed = false;
+
+    try {
+        windowObject.size = [target.width, target.height];
+        changed = true;
+    } catch (ignored) {}
+
+    try {
+        windowObject.position = [target.x, target.y];
+        changed = true;
+    } catch (ignored) {}
+
+    pauseForWindowServer();
+
+    try {
+        windowObject.size = [target.width, target.height];
+        changed = true;
+    } catch (ignored) {}
+
+    try {
+        windowObject.position = [target.x, target.y];
+        changed = true;
+    } catch (ignored) {}
+
+    if (!changed) {
+        fail("该应用拒绝调整窗口，或窗口本身不可缩放。" );
+    }
+}
+
+function rectDifference(actual, target) {
+    return Math.max(
+        Math.abs(actual.x - target.x),
+        Math.abs(actual.y - target.y),
+        Math.abs(actual.width - target.width),
+        Math.abs(actual.height - target.height)
+    );
+}
+
+function readWindowRectWithRetry(windowObject) {
+    try {
+        return windowRect(windowObject);
+    } catch (ignored) {
+        pauseForWindowServer();
+    }
+
+    try {
+        return windowRect(windowObject);
+    } catch (ignored) {
+        return null;
+    }
+}
+
+function notify(message) {
+    var app = Application.currentApplication();
+    app.includeStandardAdditions = true;
+    try {
+        app.displayNotification(message, { withTitle: SCRIPT_TITLE });
+    } catch (ignored) {
+        // Shortcuts itself will still surface a script failure if notifications are unavailable.
+    }
+}
+
+function maximizeFrontWindow() {
+    var active = frontWindow();
+    var screens = screenDescriptions();
+    var screen = chooseScreen(active.rect, screens);
+    var reserve = reserveForScreen(screen);
+    var target = targetRectForVisibleFrame(screen.visibleFrame, reserve);
+
+    setWindowRect(active.windowObject, target);
+    var actual = readWindowRectWithRetry(active.windowObject);
+
+    if (actual && rectDifference(actual, target) > CONFIG.edgeTolerance) {
+        setWindowRect(active.windowObject, target);
+        actual = readWindowRectWithRetry(active.windowObject);
+    }
+
+    if (actual && rectDifference(actual, target) > CONFIG.edgeTolerance) {
+        fail(active.appName + " 对窗口尺寸有限制，未能精确贴合目标区域。" );
+    }
+
+    return {
+        ok: true,
+        application: active.appName,
+        screen: screen.name,
+        reserve: target.reserve,
+        target: target,
+        verified: actual !== null,
+        actual: actual
+    };
+}
+
+function assertEqual(actual, expected, label) {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        fail("自检失败：" + label + "；实际 " + JSON.stringify(actual) +
+            "，预期 " + JSON.stringify(expected));
+    }
+}
+
+function selfTest() {
+    assertEqual(intersectionArea(
+        makeRect(0, 0, 100, 100),
+        makeRect(50, 25, 100, 100)
+    ), 3750, "重叠面积");
+
+    var screens = [
+        { name: "左", frame: makeRect(-1000, 0, 1000, 800) },
+        { name: "主", frame: makeRect(0, 0, 1200, 900) }
+    ];
+    assertEqual(
+        chooseScreen(makeRect(-300, 100, 600, 500), screens).name,
+        "左",
+        "跨屏窗口按重叠面积选屏"
+    );
+
+    assertEqual(
+        reserveForScreen({
+            isBuiltIn: true,
+            visibleFrame: makeRect(0, 33, 1470, 868)
+        }),
+        65,
+        "内建屏当前基准比例"
+    );
+    assertEqual(
+        reserveForScreen({
+            isBuiltIn: false,
+            visibleFrame: makeRect(-559, -1410, 2560, 1410)
+        }),
+        80,
+        "外接屏当前基准比例"
+    );
+    assertEqual(
+        reserveForScreen({
+            isBuiltIn: true,
+            visibleFrame: makeRect(0, 25, 1920, 1080)
+        }),
+        85,
+        "内建屏分辨率变化后按比例缩放"
+    );
+    assertEqual(
+        reserveForScreen({
+            isBuiltIn: false,
+            visibleFrame: makeRect(1920, 0, 3840, 2160)
+        }),
+        120,
+        "外接屏分辨率变化后按比例缩放"
+    );
+    assertEqual(
+        targetRectForVisibleFrame(makeRect(0, 33, 1470, 868), 65),
+        { x: 65, y: 33, width: 1405, height: 868, reserve: 65 },
+        "内建屏目标区域"
+    );
+    assertEqual(
+        targetRectForVisibleFrame(makeRect(-559, -1410, 2560, 1410), 80),
+        { x: -479, y: -1410, width: 2480, height: 1410, reserve: 80 },
+        "外接屏目标区域"
+    );
+    assertEqual(
+        cocoaRectToAccessibility(makeRect(0, 80, 1512, 875), 980),
+        makeRect(0, 25, 1512, 875),
+        "Cocoa 与辅助功能坐标转换"
+    );
+
+    return { ok: true, tests: 9 };
+}
+
+function run(argv) {
+    try {
+        if (argv && argv.indexOf("--self-test") !== -1) {
+            return JSON.stringify(selfTest());
+        }
+        return JSON.stringify(maximizeFrontWindow());
+    } catch (error) {
+        var message = String(error.message || error);
+        notify(message);
+        return JSON.stringify({ ok: false, error: message });
+    }
+}
